@@ -82,6 +82,38 @@ jobs:
           restore-keys: |
             fritchii-v41-linux-ccache-
 
+      - name: Prefetch SDL3 checksum (GitHub API fallback)
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="3.4.14-1788231389-147a8ee32d"
+          artifact="SDL3-linux-amd64-${version}.tar.zst"
+          checksum_dir=".cache/cpm/.checksums"
+          mkdir -p "$checksum_dir"
+          dest="$checksum_dir/${artifact}.sha512sum"
+          direct="https://github.com/crueter-ci/SDL3/releases/download/${version}/${artifact}.sha512sum"
+          api="https://api.github.com/repos/crueter-ci/SDL3/releases/assets/538855747"
+          if ! curl --fail --location --silent --show-error \
+              --retry 4 --retry-all-errors --retry-delay 5 \
+              --max-time 90 --output "$dest" "$direct"; then
+            echo "::warning::Direct SDL3 checksum download failed; using GitHub asset API"
+            rm -f "$dest"
+            curl --fail --location --silent --show-error \
+              --retry 6 --retry-all-errors --retry-delay 10 \
+              --max-time 120 -H 'Accept: application/octet-stream' \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              --output "$dest" "$api"
+          fi
+          checksum="$(tr -d '\\r\\n' < "$dest")"
+          if [[ ! "$checksum" =~ ^[0-9a-fA-F]{128}$ ]]; then
+            echo "::error::SDL3 SHA-512 checksum response was not 128 hexadecimal characters"
+            exit 1
+          fi
+          printf '%s' "$checksum" > "$dest"
+          echo "Verified SDL3 checksum metadata."
+
       - name: Configure Release
         shell: bash
         run: |
