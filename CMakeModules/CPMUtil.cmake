@@ -1050,9 +1050,29 @@ function(AddCIPackage)
         set(sha512sum_file
             "${CMAKE_CURRENT_BINARY_DIR}/.cpmutil_${ARTIFACT}_sha512sum")
 
-        file(DOWNLOAD "${sha512sum_url}" "${sha512sum_file}"
-            STATUS sha512sum_status)
-        list(GET sha512sum_status 0 sha512sum_error)
+        # The CI runner may already have fetched and verified this checksum
+        # through the GitHub release-asset API, which avoids sporadic release 504s.
+        set(cached_checksum
+            "${CPM_SOURCE_CACHE}/.checksums/${ARTIFACT}.sha512sum")
+        if(EXISTS "${cached_checksum}")
+            file(COPY_FILE "${cached_checksum}" "${sha512sum_file}")
+            set(sha512sum_error 0)
+        else()
+            # Normal developer builds keep the original download path, with retries.
+            foreach(attempt RANGE 1 8)
+                file(DOWNLOAD "${sha512sum_url}" "${sha512sum_file}"
+                    STATUS sha512sum_status TIMEOUT 60 INACTIVITY_TIMEOUT 25)
+                list(GET sha512sum_status 0 sha512sum_error)
+                if(NOT sha512sum_error)
+                    break()
+                endif()
+                message(WARNING "[CPMUtil] Checksum download attempt ${attempt}/8 "
+                    "failed for ${ARTIFACT_NAME}: ${sha512sum_status}")
+                if(attempt LESS 8)
+                    execute_process(COMMAND "${CMAKE_COMMAND}" -E sleep 7)
+                endif()
+            endforeach()
+        endif()
 
         if(sha512sum_error)
             message(FATAL_ERROR "[CPMUtil] Failed to download sha512sum "
@@ -1061,6 +1081,10 @@ function(AddCIPackage)
 
         file(READ "${sha512sum_file}" sha512sum_hash)
         string(STRIP "${sha512sum_hash}" sha512sum_hash)
+        string(LENGTH "${sha512sum_hash}" hash_length)
+        if(NOT hash_length EQUAL 128)
+            message(FATAL_ERROR "[CPMUtil] Invalid SHA-512 checksum for ${ARTIFACT_NAME}")
+        endif()
         file(REMOVE "${sha512sum_file}")
 
         AddPackage(
