@@ -75,7 +75,7 @@ jobs:
             fritchii-v41-linux-cpm-
 
       - name: Restore compiler cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: .ccache
           key: fritchii-v41-linux-ccache-${{ github.run_id }}
@@ -113,6 +113,12 @@ jobs:
           test -x build/release/bin/eden-cli
           ccache --show-stats || true
 
+      - name: Save compiler cache after successful compilation
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: fritchii-v41-linux-ccache-${{ github.run_id }}
+
       - name: Package tar.gz
         shell: bash
         run: |
@@ -120,16 +126,57 @@ jobs:
           strip build/release/bin/lichii build/release/bin/eden-cli
           tar -czf "lichii-$SHORT_SHA-linux-x86_64.tar.gz" -C build/release/bin lichii eden-cli
 
+      - name: Upload compiled Linux tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: lichii-linux-x86_64-tarball
+          path: lichii-*-linux-x86_64.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
       - name: Package AppImage with linuxdeploy
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tools="$RUNNER_TEMP/linuxdeploy"
           mkdir -p "$tools"
-          curl -fsSL --retry 3 -o "$tools/linuxdeploy-x86_64.AppImage" \
-            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
-          curl -fsSL --retry 3 -o "$tools/linuxdeploy-plugin-qt-x86_64.AppImage" \
-            https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+
+          # A GitHub release-download 504 is transient and unrelated to the project.
+          # Try the release URL, then GitHub's asset API. Avoid treating HTML/JSON errors
+          # as executable downloads.
+          download_appimage() {
+            local dest="$1" repo="$2" asset_id="$3" filename="$4"
+            local direct="https://github.com/$repo/releases/download/continuous/$filename"
+            local api="https://api.github.com/repos/$repo/releases/assets/$asset_id"
+            rm -f "$dest"
+            if ! curl --fail --location --silent --show-error \
+              --retry 6 --retry-all-errors --retry-delay 10 \
+              --connect-timeout 20 --max-time 180 \
+              --output "$dest" "$direct"; then
+              echo "::warning::Direct GitHub release download failed for $filename; trying asset API"
+              rm -f "$dest"
+              curl --fail --location --silent --show-error \
+                --retry 6 --retry-all-errors --retry-delay 10 \
+                --connect-timeout 20 --max-time 180 \
+                -H 'Accept: application/octet-stream' \
+                -H "Authorization: Bearer $GITHUB_TOKEN" \
+                --output "$dest" "$api"
+            fi
+            if ! file "$dest" | grep -Fq 'ELF 64-bit'; then
+              echo "::error::Downloaded $filename is not a Linux x86_64 AppImage binary"
+              file "$dest"
+              head -c 150 "$dest" || true
+              exit 1
+            fi
+          }
+
+          download_appimage "$tools/linuxdeploy-x86_64.AppImage" \
+            "linuxdeploy/linuxdeploy" 699514588 "linuxdeploy-x86_64.AppImage"
+          download_appimage "$tools/linuxdeploy-plugin-qt-x86_64.AppImage" \
+            "linuxdeploy/linuxdeploy-plugin-qt" 525032210 "linuxdeploy-plugin-qt-x86_64.AppImage"
           chmod +x "$tools"/*.AppImage
           icon="$RUNNER_TEMP/io.github.zortos293.lichii.png"
           cp dist/lichii.png "$icon"
@@ -162,13 +209,11 @@ jobs:
           test -x squashfs-root/usr/bin/eden-cli
           echo "Both executables are bundled."
 
-      - name: Upload Linux x86_64 artifacts
+      - name: Upload x86_64 AppImage
         uses: actions/upload-artifact@v4
         with:
-          name: lichii-linux-x86_64
-          path: |
-            lichii-*-linux-x86_64.AppImage
-            lichii-*-linux-x86_64.tar.gz
+          name: lichii-linux-x86_64-AppImage
+          path: lichii-*-linux-x86_64.AppImage
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
