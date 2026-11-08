@@ -1,0 +1,251 @@
+name: Fritchii v4.1 Linux x86_64 AppImage
+on:
+  push:
+    branches:
+      - ci/linux-appimage-v4.1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fritchii-linux-x86_64
+  cancel-in-progress: true
+
+jobs:
+  linux-appimage:
+    name: Build and package Linux x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 3000M
+      CCACHE_COMPILERCHECK: content
+
+    steps:
+      - name: Check out patched fork
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify source and architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          grep -Fq 'using MergeStatus = decltype(VideoCommon::PipelineCacheMergeResult::status);' src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+          grep -Fq 'const auto indirect_cpu = gpu_memory->GpuToCpuAddress(*indirect)' src/video_core/renderer_vulkan/vk_rasterizer.cpp
+          echo "SHORT_SHA=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+          git log -1 --oneline
+
+      - name: Install Linux dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf cmake g++ gcc git glslang-tools libglu1-mesa-dev \
+            libpulse-dev libtool libudev-dev libxkbcommon-x11-0 \
+            mesa-common-dev nasm ninja-build qt6-base-private-dev \
+            qt6-charts-dev qt6-tools-dev libavfilter-dev libavcodec-dev \
+            libswscale-dev pkg-config zlib1g-dev libva-dev libvdpau-dev \
+            spirv-tools spirv-headers libusb-1.0-0-dev \
+            libboost-dev libboost-fiber-dev libboost-context-dev \
+            libopus-dev libasound2-dev ccache \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
+            libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+            libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+
+      - name: Install Qt 6.8.3
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          modules: qtcharts
+          cache: true
+
+      - name: Restore source dependency cache
+        uses: actions/cache@v4
+        with:
+          path: .cache/cpm
+          key: fritchii-v41-linux-cpm-${{ hashFiles('cpmfile.json') }}
+          restore-keys: |
+            fritchii-v41-linux-cpm-
+
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: fritchii-v41-linux-ccache-${{ github.run_id }}
+          restore-keys: |
+            fritchii-v41-linux-ccache-
+
+      - name: Prefetch SDL3 checksum (GitHub API fallback)
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="3.4.14-1788231389-147a8ee32d"
+          artifact="SDL3-linux-amd64-${version}.tar.zst"
+          checksum_dir=".cache/cpm/.checksums"
+          mkdir -p "$checksum_dir"
+          dest="$checksum_dir/${artifact}.sha512sum"
+          direct="https://github.com/crueter-ci/SDL3/releases/download/${version}/${artifact}.sha512sum"
+          api="https://api.github.com/repos/crueter-ci/SDL3/releases/assets/538855747"
+          if ! curl --fail --location --silent --show-error \
+              --retry 4 --retry-all-errors --retry-delay 5 \
+              --max-time 90 --output "$dest" "$direct"; then
+            echo "::warning::Direct SDL3 checksum download failed; using GitHub asset API"
+            rm -f "$dest"
+            curl --fail --location --silent --show-error \
+              --retry 6 --retry-all-errors --retry-delay 10 \
+              --max-time 120 -H 'Accept: application/octet-stream' \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              --output "$dest" "$api"
+          fi
+          checksum="$(tr -d '\r\n' < "$dest")"
+          if [[ ! "$checksum" =~ ^[0-9a-fA-F]{128}$ ]]; then
+            echo "::error::SDL3 SHA-512 checksum response was not 128 hexadecimal characters"
+            exit 1
+          fi
+          printf '%s' "$checksum" > "$dest"
+          echo "Verified SDL3 checksum metadata."
+
+      - name: Configure Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build/release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DYUZU_TESTS=OFF \
+            -DYUZU_CMD=ON \
+            -DYUZU_ROOM=OFF \
+            -DYUZU_ROOM_STANDALONE=OFF \
+            -DYUZU_USE_BUNDLED_QT=OFF \
+            "-DCMAKE_PREFIX_PATH=$QT_ROOT_DIR" \
+            -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DVulkanHeaders_FORCE_BUNDLED=ON \
+            -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
+            -DENABLE_UPDATE_CHECKER=ON \
+            "-DLICHII_BUILD_TAG=linux-$GITHUB_RUN_NUMBER" \
+            -DLICHII_BUILD_PLATFORM=linux-x86_64 \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            -DUSE_CCACHE=ON
+
+      - name: Build GUI and CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build build/release --target yuzu yuzu-cmd --parallel 2
+          test -x build/release/bin/lichii
+          test -x build/release/bin/eden-cli
+          ccache --show-stats || true
+
+      - name: Save compiler cache after successful compilation
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: fritchii-v41-linux-ccache-${{ github.run_id }}
+
+      - name: Package tar.gz
+        shell: bash
+        run: |
+          set -euo pipefail
+          strip build/release/bin/lichii build/release/bin/eden-cli
+          tar -czf "lichii-$SHORT_SHA-linux-x86_64.tar.gz" -C build/release/bin lichii eden-cli
+
+      - name: Upload compiled Linux tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: lichii-linux-x86_64-tarball
+          path: lichii-*-linux-x86_64.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Package AppImage with linuxdeploy
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/linuxdeploy"
+          mkdir -p "$tools"
+
+          # A GitHub release-download 504 is transient and unrelated to the project.
+          # Try the release URL, then GitHub's asset API. Avoid treating HTML/JSON errors
+          # as executable downloads.
+          download_appimage() {
+            local dest="$1" repo="$2" asset_id="$3" filename="$4"
+            local direct="https://github.com/$repo/releases/download/continuous/$filename"
+            local api="https://api.github.com/repos/$repo/releases/assets/$asset_id"
+            rm -f "$dest"
+            if ! curl --fail --location --silent --show-error \
+              --retry 6 --retry-all-errors --retry-delay 10 \
+              --connect-timeout 20 --max-time 180 \
+              --output "$dest" "$direct"; then
+              echo "::warning::Direct GitHub release download failed for $filename; trying asset API"
+              rm -f "$dest"
+              curl --fail --location --silent --show-error \
+                --retry 6 --retry-all-errors --retry-delay 10 \
+                --connect-timeout 20 --max-time 180 \
+                -H 'Accept: application/octet-stream' \
+                -H "Authorization: Bearer $GITHUB_TOKEN" \
+                --output "$dest" "$api"
+            fi
+            if ! file "$dest" | grep -Fq 'ELF 64-bit'; then
+              echo "::error::Downloaded $filename is not a Linux x86_64 AppImage binary"
+              file "$dest"
+              head -c 150 "$dest" || true
+              exit 1
+            fi
+          }
+
+          download_appimage "$tools/linuxdeploy-x86_64.AppImage" \
+            "linuxdeploy/linuxdeploy" 699514588 "linuxdeploy-x86_64.AppImage"
+          download_appimage "$tools/linuxdeploy-plugin-qt-x86_64.AppImage" \
+            "linuxdeploy/linuxdeploy-plugin-qt" 525032210 "linuxdeploy-plugin-qt-x86_64.AppImage"
+          chmod +x "$tools"/*.AppImage
+          icon="$RUNNER_TEMP/io.github.zortos293.lichii.png"
+          cp dist/lichii.png "$icon"
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          export QMAKE="$QT_ROOT_DIR/bin/qmake"
+          export EXTRA_QT_MODULES=waylandcompositor
+          export EXTRA_PLATFORM_PLUGINS='libqwayland-egl.so;libqwayland-generic.so'
+          export LDAI_VERSION="linux-$GITHUB_RUN_NUMBER-$SHORT_SHA"
+          export LDAI_OUTPUT="lichii-$SHORT_SHA-linux-x86_64.AppImage"
+          export OUTPUT="$LDAI_OUTPUT"
+          export ARCH=x86_64
+          "$tools/linuxdeploy-x86_64.AppImage" --appdir AppDir \
+            --executable build/release/bin/lichii \
+            --executable build/release/bin/eden-cli \
+            --desktop-file dist/io.github.zortos293.lichii.desktop \
+            --icon-file "$icon" \
+            --plugin qt \
+            --output appimage
+          test -s "$LDAI_OUTPUT"
+          ls -lh "$LDAI_OUTPUT"
+
+      - name: Verify AppImage contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          appimage="lichii-$SHORT_SHA-linux-x86_64.AppImage"
+          chmod +x "$appimage"
+          "./$appimage" --appimage-extract >/dev/null
+          test -x squashfs-root/usr/bin/lichii
+          test -x squashfs-root/usr/bin/eden-cli
+          echo "Both executables are bundled."
+
+      - name: Upload x86_64 AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: lichii-linux-x86_64-AppImage
+          path: lichii-*-linux-x86_64.AppImage
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
