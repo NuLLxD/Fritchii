@@ -106,7 +106,7 @@ jobs:
               -H "Authorization: Bearer $GITHUB_TOKEN" \
               --output "$dest" "$api"
           fi
-          checksum="$(tr -d '\\r\\n' < "$dest")"
+          checksum="$(tr -d '\r\n' < "$dest")"
           if [[ ! "$checksum" =~ ^[0-9a-fA-F]{128}$ ]]; then
             echo "::error::SDL3 SHA-512 checksum response was not 128 hexadecimal characters"
             exit 1
