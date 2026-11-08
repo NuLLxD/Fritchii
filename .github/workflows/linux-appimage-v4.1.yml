@@ -1,0 +1,174 @@
+name: Fritchii v4.1 Linux x86_64 AppImage
+on:
+  push:
+    branches:
+      - ci/linux-appimage-v4.1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fritchii-linux-x86_64
+  cancel-in-progress: true
+
+jobs:
+  linux-appimage:
+    name: Build and package Linux x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 3000M
+      CCACHE_COMPILERCHECK: content
+
+    steps:
+      - name: Check out patched fork
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify source and architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          grep -Fq 'using MergeStatus = decltype(VideoCommon::PipelineCacheMergeResult::status);' src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+          grep -Fq 'const auto indirect_cpu = gpu_memory->GpuToCpuAddress(*indirect)' src/video_core/renderer_vulkan/vk_rasterizer.cpp
+          echo "SHORT_SHA=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+          git log -1 --oneline
+
+      - name: Install Linux dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf cmake g++ gcc git glslang-tools libglu1-mesa-dev \
+            libpulse-dev libtool libudev-dev libxkbcommon-x11-0 \
+            mesa-common-dev nasm ninja-build qt6-base-private-dev \
+            qt6-charts-dev qt6-tools-dev libavfilter-dev libavcodec-dev \
+            libswscale-dev pkg-config zlib1g-dev libva-dev libvdpau-dev \
+            spirv-tools spirv-headers libusb-1.0-0-dev \
+            libboost-dev libboost-fiber-dev libboost-context-dev \
+            libopus-dev libasound2-dev ccache \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
+            libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+            libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+
+      - name: Install Qt 6.8.3
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          modules: qtcharts
+          cache: true
+
+      - name: Restore source dependency cache
+        uses: actions/cache@v4
+        with:
+          path: .cache/cpm
+          key: fritchii-v41-linux-cpm-${{ hashFiles('cpmfile.json') }}
+          restore-keys: |
+            fritchii-v41-linux-cpm-
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: fritchii-v41-linux-ccache-${{ github.run_id }}
+          restore-keys: |
+            fritchii-v41-linux-ccache-
+
+      - name: Configure Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build/release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DYUZU_TESTS=OFF \
+            -DYUZU_CMD=ON \
+            -DYUZU_ROOM=OFF \
+            -DYUZU_ROOM_STANDALONE=OFF \
+            -DYUZU_USE_BUNDLED_QT=OFF \
+            "-DCMAKE_PREFIX_PATH=$QT_ROOT_DIR" \
+            -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DVulkanHeaders_FORCE_BUNDLED=ON \
+            -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
+            -DENABLE_UPDATE_CHECKER=ON \
+            "-DLICHII_BUILD_TAG=linux-$GITHUB_RUN_NUMBER" \
+            -DLICHII_BUILD_PLATFORM=linux-x86_64 \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            -DUSE_CCACHE=ON
+
+      - name: Build GUI and CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build build/release --target yuzu yuzu-cmd --parallel 2
+          test -x build/release/bin/lichii
+          test -x build/release/bin/eden-cli
+          ccache --show-stats || true
+
+      - name: Package tar.gz
+        shell: bash
+        run: |
+          set -euo pipefail
+          strip build/release/bin/lichii build/release/bin/eden-cli
+          tar -czf "lichii-$SHORT_SHA-linux-x86_64.tar.gz" -C build/release/bin lichii eden-cli
+
+      - name: Package AppImage with linuxdeploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/linuxdeploy"
+          mkdir -p "$tools"
+          curl -fsSL --retry 3 -o "$tools/linuxdeploy-x86_64.AppImage" \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          curl -fsSL --retry 3 -o "$tools/linuxdeploy-plugin-qt-x86_64.AppImage" \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x "$tools"/*.AppImage
+          icon="$RUNNER_TEMP/io.github.zortos293.lichii.png"
+          cp dist/lichii.png "$icon"
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          export QMAKE="$QT_ROOT_DIR/bin/qmake"
+          export EXTRA_QT_MODULES=waylandcompositor
+          export EXTRA_PLATFORM_PLUGINS='libqwayland-egl.so;libqwayland-generic.so'
+          export LDAI_VERSION="linux-$GITHUB_RUN_NUMBER-$SHORT_SHA"
+          export LDAI_OUTPUT="lichii-$SHORT_SHA-linux-x86_64.AppImage"
+          export OUTPUT="$LDAI_OUTPUT"
+          export ARCH=x86_64
+          "$tools/linuxdeploy-x86_64.AppImage" --appdir AppDir \
+            --executable build/release/bin/lichii \
+            --executable build/release/bin/eden-cli \
+            --desktop-file dist/io.github.zortos293.lichii.desktop \
+            --icon-file "$icon" \
+            --plugin qt \
+            --output appimage
+          test -s "$LDAI_OUTPUT"
+          ls -lh "$LDAI_OUTPUT"
+
+      - name: Verify AppImage contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          appimage="lichii-$SHORT_SHA-linux-x86_64.AppImage"
+          chmod +x "$appimage"
+          "./$appimage" --appimage-extract >/dev/null
+          test -x squashfs-root/usr/bin/lichii
+          test -x squashfs-root/usr/bin/eden-cli
+          echo "Both executables are bundled."
+
+      - name: Upload Linux x86_64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lichii-linux-x86_64
+          path: |
+            lichii-*-linux-x86_64.AppImage
+            lichii-*-linux-x86_64.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
